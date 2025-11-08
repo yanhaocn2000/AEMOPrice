@@ -1,10 +1,14 @@
 from datetime import datetime, timedelta
+from typing import Dict
+
+from datetime import datetime, timedelta
 
 import pytest
 
 from src.backtesting.backtest_engine import BacktestEngine
 from src.trading.execution.order_executor import SimulatedOrderExecutor
-from src.trading.optimization.genetic_optimizer import GeneticOptimizer
+from src.trading.optimization.genetic_optimizer import GeneticOptimizer, ParameterSpec
+from src.trading.strategies.advanced_strategies import DualMovingAverageStrategy
 from src.trading.strategies.ml_strategy import MLTradingStrategy
 
 
@@ -65,4 +69,47 @@ def test_genetic_optimizer_returns_reasonable_parameters():
 
     assert len(final_result.trades) > 0
     assert "total_return" in final_result.metrics
+
+
+def test_genetic_optimizer_with_custom_parameters():
+    market_data, feature_data = _build_dataset()
+
+    def builder(params: Dict[str, float]) -> DualMovingAverageStrategy:
+        return DualMovingAverageStrategy(
+            region="NSW1",
+            short_window=int(params["short_window"]),
+            long_window=int(params["long_window"]),
+            threshold=params["threshold"],
+            base_lot=params["base_lot"],
+            leverage=params["leverage"],
+        )
+
+    specs = [
+        ParameterSpec("short_window", 3, 10, precision=1.0, is_integer=True),
+        ParameterSpec("long_window", 12, 30, precision=1.0, is_integer=True),
+        ParameterSpec("threshold", 0.0, 0.01, precision=0.0005),
+        ParameterSpec("base_lot", 5.0, 60.0, precision=0.5),
+        ParameterSpec("leverage", 2.0, 12.0, precision=0.5),
+    ]
+
+    optimizer = GeneticOptimizer(
+        region="NSW1",
+        parameter_specs=specs,
+        strategy_factory=builder,
+        population_size=6,
+        generations=4,
+        random_seed=3,
+    )
+
+    result = optimizer.optimise(market_data, feature_data)
+    assert set(result.best_params.keys()) == {spec.name for spec in specs}
+    assert len(result.history) == 4
+
+    strategy = builder(result.best_params)
+    executor = SimulatedOrderExecutor()
+    engine = BacktestEngine(strategy=strategy, executor=executor)
+    backtest = engine.run(market_data, feature_data)
+
+    assert "total_return" in backtest.metrics
+
 

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 from src.backtesting.backtest_engine import BacktestEngine
 from src.trading.execution.order_executor import SimulatedOrderExecutor
+from src.trading.strategies.base import TradingStrategy
 from src.trading.strategies.ml_strategy import MLTradingStrategy
 from src.utils.logging_config import setup_logging
 
@@ -17,9 +18,19 @@ FeatureRow = Mapping[str, Any]
 
 
 @dataclass
+class ParameterSpec:
+    """Describe the bounds and rounding of an optimisable parameter."""
+
+    name: str
+    lower: float
+    upper: float
+    precision: float = 0.0001
+    is_integer: bool = False
+
+
+@dataclass
 class CandidateEvaluation:
-    threshold: float
-    lot_size: float
+    params: Dict[str, float]
     fitness: float
     train_metrics: Dict[str, float]
     validation_metrics: Dict[str, float]
@@ -41,8 +52,11 @@ class GeneticOptimizer:
     def __init__(
         self,
         region: str,
-        threshold_range: Tuple[float, float],
-        lot_size_range: Tuple[float, float],
+        threshold_range: Tuple[float, float] | None = None,
+        lot_size_range: Tuple[float, float] | None = None,
+        *,
+        parameter_specs: Sequence[ParameterSpec] | None = None,
+        strategy_factory: Callable[[Dict[str, float]], TradingStrategy] | None = None,
         population_size: int = 12,
         generations: int = 15,
         crossover_rate: float = 0.7,
@@ -53,9 +67,39 @@ class GeneticOptimizer:
     ) -> None:
         import random
 
+        if parameter_specs is None:
+            if threshold_range is None or lot_size_range is None:
+                raise ValueError(
+                    "threshold_range and lot_size_range must be provided when parameter_specs are omitted"
+                )
+            parameter_specs = (
+                ParameterSpec("threshold", threshold_range[0], threshold_range[1]),
+                ParameterSpec("lot_size", lot_size_range[0], lot_size_range[1]),
+            )
+        else:
+            if threshold_range is not None or lot_size_range is not None:
+                raise ValueError(
+                    "Do not provide threshold_range/lot_size_range when parameter_specs are supplied"
+                )
+
         self.region = region
-        self.threshold_range = threshold_range
-        self.lot_size_range = lot_size_range
+        self.parameter_specs = list(parameter_specs)
+        if not self.parameter_specs:
+            raise ValueError("At least one parameter specification must be provided")
+        self.parameter_names = [spec.name for spec in self.parameter_specs]
+
+        if strategy_factory is None:
+            def default_factory(params: Dict[str, float]) -> TradingStrategy:
+                return MLTradingStrategy(
+                    region=region,
+                    threshold=float(params.get("threshold", 0.0)),
+                    lot_size=float(params.get("lot_size", 1.0)),
+                )
+
+            self.strategy_factory = default_factory
+        else:
+            self.strategy_factory = strategy_factory
+
         self.population_size = max(4, population_size)
         self.generations = max(1, generations)
         self.crossover_rate = crossover_rate
@@ -80,7 +124,7 @@ class GeneticOptimizer:
             raise ValueError("Insufficient aligned data for optimisation")
 
         population = self._initialise_population()
-        evaluations: Dict[Tuple[float, float], CandidateEvaluation] = {}
+        evaluations: Dict[Tuple[float, ...], CandidateEvaluation] = {}
         history: List[Dict[str, float]] = []
 
         train_market, val_market, train_features, val_features = self._split_dataset(
@@ -92,31 +136,27 @@ class GeneticOptimizer:
         for generation in range(self.generations):
             generation_evals: List[CandidateEvaluation] = []
             for individual in population:
-                key = (individual["threshold"], individual["lot_size"])
+                key = self._make_key(individual)
                 cached = evaluations.get(key)
                 if cached is None:
                     evaluation = self._evaluate_candidate(
                         individual, train_market, val_market, train_features, val_features
                     )
                     evaluations[key] = evaluation
-                generation_evals.append(evaluations[key])
+                    cached = evaluation
+                generation_evals.append(cached)
 
             generation_evals.sort(key=lambda item: item.fitness, reverse=True)
             best_eval = generation_evals[0] if generation_evals else best_eval
             if best_eval is None:
                 raise RuntimeError("Failed to evaluate population")
 
-            history.append({
-                "generation": float(generation),
-                "fitness": float(best_eval.fitness),
-                "threshold": float(best_eval.threshold),
-                "lot_size": float(best_eval.lot_size),
-            })
+            snapshot = {"generation": float(generation), "fitness": float(best_eval.fitness)}
+            for name in self.parameter_names:
+                snapshot[name] = float(best_eval.params[name])
+            history.append(snapshot)
 
-            elites = [
-                {"threshold": eval.threshold, "lot_size": eval.lot_size}
-                for eval in generation_evals[: self.elite_size]
-            ]
+            elites = [dict(eval.params) for eval in generation_evals[: self.elite_size]]
 
             new_population = elites.copy()
             while len(new_population) < self.population_size:
@@ -137,7 +177,7 @@ class GeneticOptimizer:
         )
 
         return OptimizationResult(
-            best_params={"threshold": best_eval.threshold, "lot_size": best_eval.lot_size},
+            best_params=dict(best_eval.params),
             train_metrics=best_eval.train_metrics,
             validation_metrics=best_eval.validation_metrics,
             overfitting_penalty=penalty,
@@ -187,20 +227,18 @@ class GeneticOptimizer:
 
     def _initialise_population(self) -> List[Dict[str, float]]:
         population: List[Dict[str, float]] = []
-        boundaries = [
-            {"threshold": self.threshold_range[0], "lot_size": self.lot_size_range[0]},
-            {"threshold": self.threshold_range[1], "lot_size": self.lot_size_range[1]},
-        ]
 
-        for candidate in boundaries:
-            population.append(self._clamp_and_round(candidate))
+        lower_candidate = {spec.name: spec.lower for spec in self.parameter_specs}
+        upper_candidate = {spec.name: spec.upper for spec in self.parameter_specs}
+        population.append(self._clamp_and_round(lower_candidate))
+        population.append(self._clamp_and_round(upper_candidate))
 
         while len(population) < self.population_size:
-            threshold = self.random.uniform(*self.threshold_range)
-            lot_size = self.random.uniform(*self.lot_size_range)
-            population.append(
-                self._clamp_and_round({"threshold": threshold, "lot_size": lot_size})
-            )
+            candidate = {
+                spec.name: self.random.uniform(spec.lower, spec.upper)
+                for spec in self.parameter_specs
+            }
+            population.append(self._clamp_and_round(candidate))
 
         return population[: self.population_size]
 
@@ -212,29 +250,23 @@ class GeneticOptimizer:
         train_features: Sequence[FeatureRow],
         val_features: Sequence[FeatureRow],
     ) -> CandidateEvaluation:
-        threshold = candidate["threshold"]
-        lot_size = candidate["lot_size"]
+        params = self._clamp_and_round(candidate)
 
-        strategy = MLTradingStrategy(region=self.region, threshold=threshold, lot_size=lot_size)
-        executor = SimulatedOrderExecutor()
-
-        train_engine = BacktestEngine(strategy=strategy, executor=executor)
+        strategy_train = self.strategy_factory(dict(params))
+        train_engine = BacktestEngine(strategy=strategy_train, executor=SimulatedOrderExecutor())
         train_result = train_engine.run(train_market, train_features)
 
-        # Re-initialise strategy/executor for validation to avoid state leakage
-        val_strategy = MLTradingStrategy(region=self.region, threshold=threshold, lot_size=lot_size)
-        val_executor = SimulatedOrderExecutor()
-        val_engine = BacktestEngine(strategy=val_strategy, executor=val_executor)
+        strategy_val = self.strategy_factory(dict(params))
+        val_engine = BacktestEngine(strategy=strategy_val, executor=SimulatedOrderExecutor())
         val_result = val_engine.run(val_market, val_features)
 
-        train_return = train_result.metrics.get("total_return", 0.0)
-        val_return = val_result.metrics.get("total_return", 0.0)
+        train_return = float(train_result.metrics.get("total_return", 0.0))
+        val_return = float(val_result.metrics.get("total_return", 0.0))
         penalty = abs(train_return - val_return)
         fitness = 0.6 * train_return + 0.4 * val_return - penalty
 
         return CandidateEvaluation(
-            threshold=float(threshold),
-            lot_size=float(lot_size),
+            params=params,
             fitness=float(fitness),
             train_metrics=train_result.metrics,
             validation_metrics=val_result.metrics,
@@ -244,36 +276,48 @@ class GeneticOptimizer:
         k = min(3, len(evaluations))
         contenders = self.random.sample(list(evaluations), k=k)
         winner = max(contenders, key=lambda item: item.fitness)
-        return {"threshold": winner.threshold, "lot_size": winner.lot_size}
+        return dict(winner.params)
 
     def _crossover(self, parent_a: Mapping[str, float], parent_b: Mapping[str, float]) -> Dict[str, float]:
         if self.random.random() >= self.crossover_rate:
-            return self._clamp_and_round(dict(parent_a))
+            return self._clamp_and_round(parent_a)
 
-        threshold = (parent_a["threshold"] + parent_b["threshold"]) / 2
-        lot_size = (parent_a["lot_size"] + parent_b["lot_size"]) / 2
-        return self._clamp_and_round({"threshold": threshold, "lot_size": lot_size})
+        child: Dict[str, float] = {}
+        for spec in self.parameter_specs:
+            value = (parent_a[spec.name] + parent_b[spec.name]) / 2
+            child[spec.name] = value
+        return self._clamp_and_round(child)
 
     def _mutate(self, individual: Mapping[str, float]) -> Dict[str, float]:
         mutated = dict(individual)
 
-        if self.random.random() < self.mutation_rate:
-            span = self.threshold_range[1] - self.threshold_range[0]
-            mutated["threshold"] += (self.random.random() - 0.5) * span * 0.2
-
-        if self.random.random() < self.mutation_rate:
-            span = self.lot_size_range[1] - self.lot_size_range[0]
-            mutated["lot_size"] += (self.random.random() - 0.5) * span * 0.2
+        for spec in self.parameter_specs:
+            if self.random.random() < self.mutation_rate:
+                span = spec.upper - spec.lower
+                if span <= 0:
+                    continue
+                mutated[spec.name] += (self.random.random() - 0.5) * span * 0.2
 
         return self._clamp_and_round(mutated)
 
     def _clamp_and_round(self, values: Mapping[str, float]) -> Dict[str, float]:
-        threshold = min(max(values["threshold"], self.threshold_range[0]), self.threshold_range[1])
-        lot_size = min(max(values["lot_size"], self.lot_size_range[0]), self.lot_size_range[1])
-        return {"threshold": round(threshold, 4), "lot_size": round(lot_size, 4)}
+        clamped: Dict[str, float] = {}
+        for spec in self.parameter_specs:
+            value = values.get(spec.name, spec.lower)
+            value = min(max(value, spec.lower), spec.upper)
+            if spec.is_integer:
+                value = float(int(round(value)))
+            else:
+                precision = spec.precision if spec.precision > 0 else 0.0001
+                value = round(value / precision) * precision
+            value = min(max(value, spec.lower), spec.upper)
+            clamped[spec.name] = float(value)
+        return clamped
+
+    def _make_key(self, values: Mapping[str, float]) -> Tuple[float, ...]:
+        return tuple(float(values[name]) for name in self.parameter_names)
 
     def _ensure_datetime(self, value: Any) -> datetime:
         if isinstance(value, datetime):
             return value
         return datetime.fromisoformat(str(value))
-
