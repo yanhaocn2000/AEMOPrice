@@ -44,6 +44,7 @@ class OptimizationResult:
     overfitting_penalty: float
     fitness: float
     history: List[Dict[str, float]]
+    is_overfitting: bool
 
 
 class GeneticOptimizer:
@@ -171,10 +172,12 @@ class GeneticOptimizer:
         if best_eval is None:
             raise RuntimeError("Optimisation did not produce a best candidate")
 
-        penalty = abs(
-            best_eval.train_metrics.get("total_return", 0.0)
-            - best_eval.validation_metrics.get("total_return", 0.0)
-        )
+        train_return = float(best_eval.train_metrics.get("total_return", 0.0))
+        validation_return = float(best_eval.validation_metrics.get("total_return", 0.0))
+        penalty = abs(train_return - validation_return)
+        denominator = max(1e-9, abs(validation_return))
+        relative_gap = penalty / denominator
+        is_overfitting = relative_gap > 0.35
 
         return OptimizationResult(
             best_params=dict(best_eval.params),
@@ -183,6 +186,7 @@ class GeneticOptimizer:
             overfitting_penalty=penalty,
             fitness=best_eval.fitness,
             history=history,
+            is_overfitting=is_overfitting,
         )
 
     # ------------------------------------------------------------------

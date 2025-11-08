@@ -110,6 +110,10 @@ def test_multi_strategy_optimizer_produces_leader():
         assert result.final_metrics["total_return"] > -1.0
         assert result.trade_count >= 0
         assert len(result.optimisation.history) == 5
+        assert isinstance(result.optimisation.is_overfitting, bool)
+        assert isinstance(result.final_capital, float)
+        assert isinstance(result.equity_curve, list)
+        assert isinstance(result.trades, list)
 
     summary = summarise_multi_report(report)
     assert len(summary) == len(configs)

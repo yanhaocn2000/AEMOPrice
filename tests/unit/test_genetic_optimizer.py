@@ -55,6 +55,7 @@ def test_genetic_optimizer_returns_reasonable_parameters():
     assert result.overfitting_penalty == pytest.approx(
         abs(result.train_metrics["total_return"] - result.validation_metrics["total_return"])
     )
+    assert isinstance(result.is_overfitting, bool)
     assert len(result.history) == 6
 
     # Run a final backtest with the optimised parameters to ensure trades are produced
@@ -104,6 +105,7 @@ def test_genetic_optimizer_with_custom_parameters():
     result = optimizer.optimise(market_data, feature_data)
     assert set(result.best_params.keys()) == {spec.name for spec in specs}
     assert len(result.history) == 4
+    assert isinstance(result.is_overfitting, bool)
 
     strategy = builder(result.best_params)
     executor = SimulatedOrderExecutor()

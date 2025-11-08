@@ -32,6 +32,9 @@ class StrategyOptimizationResult:
     optimisation: OptimizationResult
     final_metrics: Dict[str, float]
     trade_count: int
+    final_capital: float
+    equity_curve: List[Dict[str, object]]
+    trades: List[Dict[str, object]]
 
 
 @dataclass
@@ -94,6 +97,23 @@ class MultiStrategyOptimizer:
                 initial_capital=self.initial_capital,
             )
             backtest_result = engine.run(market_data, feature_data)
+            equity_curve = [
+                {"timestamp": point.timestamp.isoformat(), "value": float(point.value)}
+                for point in backtest_result.equity_curve
+            ]
+            trades = [
+                {
+                    "timestamp": trade.timestamp.isoformat(),
+                    "action": trade.action,
+                    "quantity": float(trade.quantity),
+                    "price": float(trade.price),
+                    "pnl": float(trade.pnl),
+                    "commission": float(trade.commission),
+                    "slippage": float(trade.slippage),
+                }
+                for trade in backtest_result.trades
+            ]
+            final_capital = equity_curve[-1]["value"] if equity_curve else self.initial_capital
 
             results.append(
                 StrategyOptimizationResult(
@@ -101,6 +121,9 @@ class MultiStrategyOptimizer:
                     optimisation=optimisation_result,
                     final_metrics=backtest_result.metrics,
                     trade_count=len(backtest_result.trades),
+                    final_capital=final_capital,
+                    equity_curve=equity_curve,
+                    trades=trades,
                 )
             )
 
@@ -124,6 +147,8 @@ def summarise_multi_report(report: MultiStrategyReport) -> List[Dict[str, float]
             "trade_count": float(result.trade_count),
             "fitness": float(result.optimisation.fitness),
             "overfitting_penalty": float(result.optimisation.overfitting_penalty),
+            "is_overfitting": 1.0 if result.optimisation.is_overfitting else 0.0,
+            "final_capital": float(result.final_capital),
         }
         for key, value in result.optimisation.best_params.items():
             item[f"param_{key}"] = float(value)
